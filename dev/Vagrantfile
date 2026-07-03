@@ -1,0 +1,66 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+   config.vm.box = "bento/ubuntu-25.04" ## bento/ubuntu-23.10  bento/ubuntu-25.04 bento/ubuntu-24.04(running) "bento/ubuntu-23.10"(running)  bento/ubuntu-22.04  bento/ubuntu-20.04
+   ##config.vm.box_version = ">= 202510.26.0"
+   config.vm.synced_folder "../usb/", "/opt/offline-release", create: true
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = "2048"
+    vb.cpus = 1
+    vb.gui = false
+  end
+
+  config.vm.provision "shell", inline: <<-SHELL
+    set -e 
+
+    echo "=== 1. Enforcing Ironclad Air-Gap Firewall ==="
+    # Reset everything to clean slate
+    iptables -F
+    iptables -X
+
+    # Default Policies: Drop everything going out or coming in from the WAN
+    iptables -P INPUT DROP
+    iptables -P FORWARD DROP
+    iptables -P OUTPUT DROP
+
+    # RULE A: Allow unrestricted local loopback (Internal OS communication)
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A OUTPUT -o lo -j ACCEPT
+
+    # RULE B: Allow Vagrant Management Traffic (SSH/Control Plane via NAT adapter)
+    VAGRANT_IFACE=$(ip -4 route show to default | awk '{print $5}')
+    
+    if [ -n "$VAGRANT_IFACE" ]; then
+        echo "✔ Isolating main interface: $VAGRANT_IFACE while keeping port 22 open"
+        
+        # Allow established connections back and forth (so SSH won't freeze)
+        iptables -A INPUT -i $VAGRANT_IFACE -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -A OUTPUT -o $VAGRANT_IFACE -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        
+        # Allow inbound SSH requests from the host machine
+        iptables -A INPUT -i $VAGRANT_IFACE -p tcp --dport 22 -m conntrack --ctstate NEW -j ACCEPT
+    fi
+
+    echo "=== 2. Disabling Online APT Repositories ==="
+    if [ -f /etc/apt/sources.list ]; then
+        mv /etc/apt/sources.list /etc/apt/sources.list.bak
+    fi
+    
+    mkdir -p /etc/apt/sources.list.d/backup
+    if [ -d /etc/apt/sources.list.d ]; then
+        for file in /etc/apt/sources.list.d/*; do
+            if [ -f "$file" ] && [ "$(basename "$file")" != "backup" ]; then
+                mv "$file" /etc/apt/sources.list.d/backup/
+            fi
+        done
+    fi
+
+    echo "=== 3. Stopping Background Aggressive Updates ==="
+    systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+    systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+
+    echo "=== Base Environment Hardened & Isolated ==="
+  SHELL
+end
